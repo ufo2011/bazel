@@ -15,18 +15,20 @@
 package net.starlark.java.eval;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MICROSECONDS;
 
-import com.google.common.collect.ImmutableList;
 import com.google.common.flogger.GoogleLogger;
 import java.io.ByteArrayOutputStream;
-import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.GZIPOutputStream;
 import javax.annotation.Nullable;
 import net.starlark.java.syntax.Location;
@@ -57,12 +59,12 @@ import net.starlark.java.syntax.Location;
 // the operating system's identifier (tid) for the signalled thread.
 //
 // Reading from the other end of the pipe is a Java thread, the router.
-// Its job is to map each OS tid to a StarlarkThread, if the
-// thread is currently executing Starlark code, and increment
-// a volatile counter in that StarlarkThread. If the thread is
-// not executing Starlark code, the router discards the event.
+// Its job is to map each OS tid to the CPU tick counter of the
+// StarlarkThread currently executing there, and increment that counter.
+// If the thread is not executing Starlark code, the router discards
+// the event.
 // When a Starlark thread enters or leaves a function during profiling,
-// it updates the StarlarkThread-to-OS-thread mapping consulted by the
+// it updates the OS-thread-to-counter mapping consulted by the
 // router.
 //
 // If the router does not drain the pipe in a timely manner (on the
@@ -88,15 +90,19 @@ import net.starlark.java.syntax.Location;
 // allowing profiling of a portion of a long-running computation.
 
 /** A CPU profiler for Starlark (POSIX only for now). */
-final class CpuProfiler {
-
-  static {
-    JNI.load();
-  }
+public final class CpuProfiler {
 
   private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
 
   private final PprofWriter pprof;
+
+  // Native profiler support, if available.
+  private static volatile CpuProfilerNativeSupport nativeSupport = null;
+
+  /** Installs native profiler support. */
+  public static void setNativeSupport(CpuProfilerNativeSupport nativeSupport) {
+    CpuProfiler.nativeSupport = nativeSupport;
+  }
 
   private CpuProfiler(OutputStream out, Duration period) {
     this.pprof = new PprofWriter(out, period);
@@ -111,26 +117,42 @@ final class CpuProfiler {
     return instance;
   }
 
-  // Maps OS thread ID to StarlarkThread.
-  // The StarlarkThread is needed only for its cpuTicks field.
-  private static final Map<Integer, StarlarkThread> threads = new ConcurrentHashMap<>();
+  // Cache the native thread ID to avoid repeated JNI calls when registering Starlark threads.
+  private static final ThreadLocal<Integer> threadId =
+      ThreadLocal.withInitial(() -> nativeSupport.getThreadId());
 
-  /**
-   * Associates the specified StarlarkThread with the current OS thread. Returns the StarlarkThread
-   * previously associated with it, if any.
-   */
+  // Reuse each OS thread's slot for this profiling session instead of allocating a map entry
+  // for every top-level call. Slots hold only counters, not Starlark evaluation contexts.
+  private final Map<Integer, AtomicReference<AtomicInteger>> cpuTicksByThread =
+      new ConcurrentHashMap<>();
+
+  /** Associates a counter with the current OS thread and returns its previous counter, if any. */
   @Nullable
-  static StarlarkThread setStarlarkThread(StarlarkThread thread) {
-    if (thread == null) {
-      return threads.remove(gettid());
-    } else {
-      return threads.put(gettid(), thread);
+  AtomicInteger setCpuTicksForCurrentThread(@Nullable AtomicInteger cpuTicks) {
+    Integer tid = threadId.get();
+    // computeIfAbsent can lock on hash collisions even when the slot already exists.
+    AtomicReference<AtomicInteger> slot = cpuTicksByThread.get(tid);
+    if (slot == null) {
+      slot = cpuTicksByThread.computeIfAbsent(tid, unused -> new AtomicReference<>());
     }
+    return slot.getAndSet(cpuTicks);
+  }
+
+  // Keep the profiler reference out of the router frame, which can remain blocked in pipe.read
+  // after profiling stops.
+  @Nullable
+  private static AtomicInteger getCpuTicksForThread(int tid) {
+    CpuProfiler profiler = instance;
+    if (profiler == null) {
+      return null;
+    }
+    AtomicReference<AtomicInteger> slot = profiler.cpuTicksByThread.get(tid);
+    return slot == null ? null : slot.get();
   }
 
   /** Start the profiler. */
   static boolean start(OutputStream out, Duration period) {
-    if (!supported()) {
+    if (nativeSupport == null) {
       logger.atWarning().log("--starlark_cpu_profile is unsupported on this platform");
       return false;
     }
@@ -139,7 +161,7 @@ final class CpuProfiler {
     }
 
     startRouter();
-    if (!startTimer(period.toNanos() / 1000L)) {
+    if (!nativeSupport.startTimer(MICROSECONDS.convert(period))) {
       throw new IllegalStateException("profile signal handler already in use");
     }
 
@@ -156,14 +178,14 @@ final class CpuProfiler {
     CpuProfiler profiler = instance;
     instance = null;
 
-    stopTimer();
+    nativeSupport.stopTimer();
 
     // Finish writing the file and fail if there were any I/O errors.
     profiler.pprof.writeEnd();
   }
 
   /** Records a profile event. */
-  void addEvent(int ticks, ImmutableList<Debug.Frame> stack) {
+  void addEvent(int ticks, List<? extends Debug.Frame> stack) {
     pprof.writeEvent(ticks, stack);
   }
 
@@ -175,7 +197,7 @@ final class CpuProfiler {
   // On return, it is safe to install the signal handler.
   private static synchronized void startRouter() {
     if (pipe == null) {
-      pipe = new FileInputStream(createPipe());
+      pipe = new FileInputStream(nativeSupport.createPipe());
       Thread router = new Thread(CpuProfiler::router, "SIGPROF router");
       router.setDaemon(true);
       router.start();
@@ -183,7 +205,7 @@ final class CpuProfiler {
   }
 
   // The Router thread routes SIGPROF events (from the pipe)
-  // to the relevant StarlarkThread. Once started, it runs forever.
+  // to the relevant CPU tick counter. Once started, it runs forever.
   //
   // TODO(adonovan): opt: a more efficient implementation of routing would be
   // to use, instead of a pipe from the signal handler to the routing thread,
@@ -220,9 +242,9 @@ final class CpuProfiler {
       // may be changing it, so we increment the thread's counter.
       // When the thread later observes the counter is non-zero,
       // it gives us the stack by calling addEvent.
-      StarlarkThread thread = threads.get(tid);
-      if (thread != null) {
-        thread.cpuTicks.getAndIncrement();
+      AtomicInteger cpuTicks = getCpuTicksForThread(tid);
+      if (cpuTicks != null) {
+        cpuTicks.getAndIncrement();
       }
     }
   }
@@ -231,26 +253,6 @@ final class CpuProfiler {
   private static int int32be(byte[] b) {
     return b[0] << 24 | (b[1] & 0xff) << 16 | (b[2] & 0xff) << 8 | (b[3] & 0xff);
   }
-
-  // --- native code (see cpu_profiler) ---
-
-  // Reports whether the profiler is supported on this platform.
-  private static native boolean supported();
-
-  // Returns the read end of a pipe from which profile events may be read.
-  // Each event is an operating system thread ID encoded as uint32be.
-  private static native FileDescriptor createPipe();
-
-  // Starts the operating system's interval timer.
-  // The period must be a positive number of microseconds.
-  // Returns false if SIGPROF is already in use.
-  private static native boolean startTimer(long periodMicros);
-
-  // Stops the operating system's interval timer.
-  private static native void stopTimer();
-
-  // Returns the operating system's identifier for the calling thread.
-  private static native int gettid();
 
   // Encoder for pprof format profiles.
   // See https://github.com/google/pprof/tree/master/proto
@@ -289,12 +291,12 @@ final class CpuProfiler {
       }
     }
 
-    synchronized void writeEvent(int ticks, ImmutableList<Debug.Frame> stack) {
+    synchronized void writeEvent(int ticks, List<? extends Debug.Frame> stack) {
       if (this.error == null) {
         try {
           ByteArrayOutputStream sample = new ByteArrayOutputStream();
           writeLong(sample, SAMPLE_VALUE, ticks * period.toNanos() / 1000L);
-          for (Debug.Frame fr : stack.reverse()) {
+          for (Debug.Frame fr : stack.reversed()) {
             writeLong(sample, SAMPLE_LOCATION_ID, getLocationID(fr));
           }
           writeByteArray(gz, PROFILE_SAMPLE, sample.toByteArray());
@@ -307,12 +309,14 @@ final class CpuProfiler {
     synchronized void writeEnd() throws IOException {
       long endNano = System.nanoTime();
       try {
-        writeLong(gz, PROFILE_DURATION_NANOS, endNano - startNano);
         if (this.error != null) {
           throw this.error; // retained from an earlier error
         }
+        writeLong(gz, PROFILE_DURATION_NANOS, endNano - startNano);
       } finally {
-        gz.close();
+        if (gz != null) {
+          gz.close();
+        }
       }
     }
 
@@ -405,7 +409,7 @@ final class CpuProfiler {
         Location loc = fn.getLocation();
         String filename = loc.file(); // TODO(adonovan): make WORKSPACE-relative
         String name = fn.getName();
-        if (name.equals("<toplevel>")) {
+        if (name.equals(StarlarkThread.TOP_LEVEL)) {
           name = filename;
         }
 
